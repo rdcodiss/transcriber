@@ -22,6 +22,12 @@ A Windows app that transcribes audio playing through your headphones or speakers
 3. Under **Output**, choose the audio device used by the application you want to transcribe.
 4. Click **Start** to begin. Click **Stop** to finish and **Save TXT** to export the transcript.
 
+## Automatic translation
+
+Before recording, open **Translate** and select a target language. Choose **Other language…** to enter a language by name. Transcriber translates each completed segment and exports the translated text with **Save TXT**. Select **Off** to keep the spoken language. If the translation service is unavailable, the app shows the original speech.
+
+OpenAI, Groq, Google Gemini, and Mistral can reuse the transcription provider's key for text translation. For Deepgram and ElevenLabs, add an OpenAI key under **Translate → Translation key…**.
+
 Transcriber captures the audio Windows plays through the selected output device and preserves the spoken language. OpenAI Realtime displays partial transcripts as they arrive. Groq, Google Gemini, Deepgram, Mistral, and ElevenLabs update the transcript in chunks. The app stores its settings in a local `.env` file next to the executable. The repository's `.env.example` contains placeholder values.
 
 ## Development on Windows
