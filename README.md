@@ -1,19 +1,19 @@
 # Transcriber
 
-Aplicativo Windows para transcrever em texto o áudio que está tocando no fone ou alto-falante. É possível escolher a saída usada pelo IVAO ou por outro aplicativo, acompanhar a atividade de áudio e exportar o texto em TXT.
+A Windows app that transcribes audio playing through your headphones or speakers. Choose the output device used by IVAO or another application, monitor audio activity, and export the transcript as a text file.
 
-## Uso
+## Getting started
 
-1. Baixe `Transcriber.exe` em **Releases** e execute o arquivo.
-2. Em **Provider**, escolha o serviço, cole a chave e clique em **Save**.
-3. Em **Output**, escolha a saída usada pelo aplicativo cujo áudio você quer transcrever.
-4. Clique em **Start**. Use **Stop** para finalizar e **Save TXT** para exportar.
+1. Download `Transcriber.exe` from [Releases](../../releases) and run it.
+2. Under **Provider**, choose a transcription service, paste your API key, and click **Save**.
+3. Under **Output**, choose the audio device used by the application you want to transcribe.
+4. Click **Start** to begin. Click **Stop** to finish and **Save TXT** to export the transcript.
 
-O Windows fornece a mistura de áudio da saída selecionada. A transcrição preserva o idioma falado. OpenAI Realtime mostra texto parcial conforme chega. Groq, Google Gemini, Deepgram, Mistral e ElevenLabs atualizam o texto por blocos. A configuração fica no `.env` ao lado do executável. O exemplo no repositório usa valores fictícios.
+Transcriber captures the audio Windows plays through the selected output device and preserves the spoken language. OpenAI Realtime displays partial transcripts as they arrive. Groq, Google Gemini, Deepgram, Mistral, and ElevenLabs update the transcript in chunks. The app stores its settings in a local `.env` file next to the executable. The repository's `.env.example` contains placeholder values.
 
-## Desenvolvimento no Windows
+## Development on Windows
 
-Use Python 3.11 de 64 bits. Para executar o código ou rodar os testes locais:
+Use 64-bit Python 3.11. To run the app from source or run the tests locally:
 
 ```powershell
 python -m venv .venv
@@ -22,7 +22,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-Para gerar `dist\Transcriber.exe`:
+To build `dist\Transcriber.exe`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pyinstaller==6.22.3
