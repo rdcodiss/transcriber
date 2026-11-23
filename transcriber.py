@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
 import io
 import json
 import math
@@ -14,6 +15,7 @@ import wave
 import tkinter as tk
 from array import array
 from collections import deque
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -107,6 +109,13 @@ PROVIDER_PRESETS = {
 PROVIDER_CHOICES = ("Groq", "Google (Gemini)", "OpenAI", "Anthropic (Claude)", "Deepgram", "Mistral", "ElevenLabs")
 TRANSLATION_LANGUAGES = ("Portuguese (Brazil)", "English", "Spanish", "French", "German", "Italian",
                          "Japanese", "Korean", "Mandarin Chinese", "Arabic", "Hindi", "Russian")
+LEGACY_HOTKEYS = {**{f"F{key}": 0x6F + key for key in range(1, 13)}, "Insert": 0x2D}
+MOUSE_BUTTONS = {0x01: "Left mouse", 0x02: "Right mouse", 0x04: "Middle mouse", 0x05: "Mouse 4", 0x06: "Mouse 5"}
+MODIFIER_KEYS = {
+    "Shift_L": (0xA0, "Left Shift"), "Shift_R": (0xA1, "Right Shift"),
+    "Control_L": (0xA2, "Left Ctrl"), "Control_R": (0xA3, "Right Ctrl"),
+    "Alt_L": (0xA4, "Left Alt"), "Alt_R": (0xA5, "Right Alt"),
+}
 TEXT_APIS = {
     "api.openai.com": ("https://api.openai.com/v1/chat/completions", "gpt-5-mini", "Authorization"),
     "api.groq.com": ("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-20b", "Authorization"),
@@ -473,7 +482,8 @@ class PlaybackPCM:
 class Recording:
     """One session with separate queues for audio and interface events."""
 
-    def __init__(self, api: TranscriptionAPI, output_name: str = "", translator: TranslationAPI | None = None) -> None:
+    def __init__(self, api: TranscriptionAPI, output_name: str = "", translator: TranslationAPI | None = None,
+                 *, hold_to_listen: bool = False) -> None:
         self.api = api
         self.output_name = output_name
         self.translator = translator
@@ -482,6 +492,9 @@ class Recording:
         self.capture_ready = Event()
         self.capture_done = Event()
         self.transcription_failed = Event()
+        self.hold_gate = Event() if hold_to_listen else None
+        if self.hold_gate is not None:
+            self.hold_gate.set()
         self.audio: Queue[tuple[bytes, float]] = Queue(maxsize=240 if api.realtime else 12)
         self.events: Queue[tuple[str, str | float]] = Queue()
 
@@ -496,15 +509,18 @@ class Recording:
         overflow_reported = False
         block_bytes = READ_FRAMES * SAMPLE_WIDTH if self.api.realtime else SAMPLE_RATE * SAMPLE_WIDTH * self.api.chunk_seconds
 
+        def send_pending(count: int) -> None:
+            block = bytes(pending[:count])
+            self.audio.put_nowait((block, audio_level(block) if self.api.realtime else 0.0))
+            del pending[:count]
+
         def queue_audio(pcm: bytes) -> None:
             if not pcm:
                 return
             self.events.put(("level", audio_level(pcm)))
             pending.extend(pcm)
             while len(pending) >= block_bytes:
-                block = bytes(pending[:block_bytes])
-                self.audio.put_nowait((block, audio_level(block) if self.api.realtime else 0.0))
-                del pending[:block_bytes]
+                send_pending(block_bytes)
 
         try:
             if self.stop_requested.is_set():
@@ -515,11 +531,31 @@ class Recording:
                 channels = int(device["maxInputChannels"])
                 converter = PlaybackPCM(rate, channels)
                 frames = max(1, rate // 20)
+                gate = self.hold_gate
+                open_options = {"start": False} if gate is not None else {}
                 with audio.open(format=pyaudio.paInt16, channels=channels, rate=rate, input=True,
-                                input_device_index=device["index"], frames_per_buffer=frames) as stream:
+                                input_device_index=device["index"], frames_per_buffer=frames, **open_options) as stream:
+                    listening = gate is None
                     self.capture_ready.set()
                     self.events.put(("recording", ""))
                     while not self.stop_requested.is_set():
+                        if gate is not None:
+                            if gate.is_set() and not listening:
+                                converter = PlaybackPCM(rate, channels)
+                                stream.start_stream()
+                                listening = True
+                            elif not gate.is_set() and listening:
+                                stream.stop_stream()
+                                queue_audio(converter.convert(b"", final=True))
+                                if pending:
+                                    send_pending(len(pending))
+                                if self.api.realtime:
+                                    self.audio.put_nowait((b"", 0.0))
+                                listening = False
+                            if not listening:
+                                self.stop_requested.wait(0.01)
+                                continue
+
                         available = stream.get_read_available()
                         if available <= 0:
                             if not stream.is_active():
@@ -535,10 +571,13 @@ class Recording:
                                 self.events.put(("warning", "The playback device dropped some audio."))
                                 overflow_reported = True
                             continue
-                        queue_audio(converter.convert(raw))
+                        if gate is None or gate.is_set():
+                            queue_audio(converter.convert(raw))
 
-                    if not self.transcription_failed.is_set():
-                        remaining = stream.get_read_available()
+                    if listening and not self.transcription_failed.is_set():
+                        # The manual mode includes already-buffered playback. In hold mode, do
+                        # not read audio at the end because it may have played after key release.
+                        remaining = stream.get_read_available() if gate is None else 0
                         while remaining > 0 and not self.transcription_failed.is_set():
                             count = min(frames, remaining)
                             queue_audio(converter.convert(stream.read(count, exception_on_overflow=False)))
@@ -700,6 +739,10 @@ class Recording:
                         pcm, level = self.audio.get_nowait()
                     except Empty:
                         break
+                    if not pcm:
+                        await append(resampler.convert(b"", final=True))
+                        await commit()
+                        continue
                     last_packet_at = time.monotonic()
                     converted = resampler.convert(pcm)
                     await append(converted)
@@ -808,6 +851,135 @@ def rounded_image(master: tk.Misc, fill: str, border: str) -> tk.PhotoImage:
     return image
 
 
+@dataclass(frozen=True)
+class Hotkey:
+    code: int
+    label: str
+
+    @property
+    def is_mouse(self) -> bool:
+        return self.code in MOUSE_BUTTONS
+
+    @classmethod
+    def from_setting(cls, setting: str) -> Hotkey | None:
+        if setting in LEGACY_HOTKEYS:
+            return cls(LEGACY_HOTKEYS[setting], setting)
+        number, separator, label = setting.partition(":")
+        if not separator or not number.isascii() or not number.isdecimal() or len(number) > 3:
+            return None
+        code = int(number)
+        if code in MOUSE_BUTTONS:
+            return cls(code, MOUSE_BUTTONS[code])
+        if 0x08 <= code <= 0xFE and code != 0xE7 and 0 < len(label) <= 36 and label.isprintable():
+            return cls(code, label)
+        return None
+
+    @classmethod
+    def from_keyboard(cls, event: tk.Event) -> Hotkey | None:
+        if event.keysym in MODIFIER_KEYS:
+            return cls(*MODIFIER_KEYS[event.keysym])
+        code = event.keycode
+        if not isinstance(code, int) or not 0x08 <= code <= 0xFE or code == 0xE7:
+            return None
+        friendly = {"space": "Space", "Return": "Enter", "KP_Enter": "Enter", "Escape": "Esc",
+                    "Prior": "Page Up", "Next": "Page Down"}
+        label = friendly.get(event.keysym, event.keysym.replace("_", " "))
+        if len(label) == 1:
+            label = label.upper()
+        return cls(code, label[:36] if label and label != "??" else f"Key {code:02X}")
+
+    def as_setting(self) -> str:
+        return f"{self.code}:{self.label}"
+
+
+def virtual_key_is_down(code: int) -> bool:
+    if sys.platform != "win32":
+        return False
+    state = ctypes.windll.user32.GetAsyncKeyState
+    state.argtypes = (ctypes.c_int,)
+    state.restype = wintypes.SHORT
+    return bool(state(code) & 0x8000)
+
+
+class MonitorInfo(ctypes.Structure):
+    _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+
+
+class CaptionOverlay:
+    def __init__(self, root: tk.Tk, family: str) -> None:
+        window = self.window = tk.Toplevel(root, bg=BACKGROUND, takefocus=False)
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.position: tuple[int, int, int, int] | None = None
+        self.last_content: tuple[str, str, int] | None = None
+        window.title("Transcriber captions")
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.attributes("-toolwindow", True)
+        window.attributes("-alpha", 0.92)
+        self.status = tk.Label(window, bg=BACKGROUND, fg=MUTED, font=(family, 9), pady=0)
+        self.status.pack(fill="x", padx=16, pady=(8, 0))
+        self.caption = tk.Label(window, bg=BACKGROUND, fg=FOREGROUND, font=(family, 16), justify="center")
+        self.caption.pack(fill="x", padx=16, pady=(1, 9))
+        window.update_idletasks()
+        self.handle = int(window.wm_frame(), 0)
+        try:
+            self.make_click_through()
+        except OSError:
+            window.destroy()
+            raise
+
+    def make_click_through(self) -> None:
+        get_style = self.user32.GetWindowLongW
+        set_style = self.user32.SetWindowLongW
+        get_style.argtypes = (wintypes.HWND, ctypes.c_int)
+        get_style.restype = wintypes.LONG
+        set_style.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
+        set_style.restype = wintypes.LONG
+        index = -20  # GWL_EXSTYLE
+        # Layered, click-through, tool window, no activation. Remove the app-window bit.
+        style = (get_style(self.handle, index) | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000) & ~0x00040000
+        ctypes.set_last_error(0)
+        if not set_style(self.handle, index, style) and (error := ctypes.get_last_error()):
+            raise ctypes.WinError(error)
+
+    def work_area(self) -> tuple[int, int, int, int]:
+        foreground = self.user32.GetForegroundWindow
+        foreground.restype = wintypes.HWND
+        find_monitor = self.user32.MonitorFromWindow
+        find_monitor.argtypes = (wintypes.HWND, wintypes.DWORD)
+        find_monitor.restype = wintypes.HANDLE
+        monitor = find_monitor(foreground() or self.handle, 2)  # MONITOR_DEFAULTTONEAREST
+        info = MonitorInfo(ctypes.sizeof(MonitorInfo))
+        get_monitor = self.user32.GetMonitorInfoW
+        get_monitor.argtypes = (wintypes.HANDLE, ctypes.POINTER(MonitorInfo))
+        get_monitor.restype = wintypes.BOOL
+        if monitor and get_monitor(monitor, ctypes.byref(info)):
+            return info.work.left, info.work.top, info.work.right, info.work.bottom
+        return 0, 0, self.window.winfo_screenwidth(), self.window.winfo_screenheight()
+
+    def render(self, status: str, caption: str) -> None:
+        left, top, right, bottom = self.work_area()
+        width = min(620, max(1, right - left - 40))
+        content = (status, caption, width)
+        if content != self.last_content:
+            self.status.configure(text=status)
+            self.caption.configure(text=caption, wraplength=max(1, width - 40))
+            self.window.update_idletasks()
+            self.last_content = content
+        height = self.window.winfo_reqheight()
+        position = (left + (right - left - width) // 2, max(top, bottom - height - 32), width, height)
+        if position == self.position:
+            return
+        set_position = self.user32.SetWindowPos
+        set_position.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT)
+        set_position.restype = wintypes.BOOL
+        # HWND_TOPMOST with SWP_NOACTIVATE | SWP_SHOWWINDOW.
+        if set_position(self.handle, wintypes.HWND(-1), *position, 0x0010 | 0x0040):
+            self.position = position
+
+
 class TranscriberApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -826,6 +998,11 @@ class TranscriberApp:
         self.layout_name = tk.StringVar(value="Black Bar")
         self.output_name = tk.StringVar()
         self.translation_language = tk.StringVar()
+        self.hotkey: Hotkey | None = None
+        self.hotkey_pressed = False
+        self.overlay_enabled = tk.BooleanVar()
+        self.overlay: CaptionOverlay | None = None
+        self.overlay_refreshed_at = 0.0
         self.levels = deque([0.0] * 13, maxlen=13)
         self.last_level_at = 0.0
         self.live_text = ""
@@ -837,13 +1014,20 @@ class TranscriberApp:
             stored = read_setting(settings, "TRANSCRIBER_LAYOUT", "Black Bar")
             self.output_name.set(read_setting(settings, "TRANSCRIBER_OUTPUT_DEVICE"))
             self.translation_language.set(read_setting(settings, "TRANSCRIBER_TRANSLATE_TO"))
+            self.hotkey = Hotkey.from_setting(read_setting(settings, "TRANSCRIBER_HOTKEY"))
+            self.overlay_enabled.set(read_setting(settings, "TRANSCRIBER_CAPTION_OVERLAY") == "1")
         except ValueError:
             stored = "Black Bar"
         self.apply_layout(stored if stored in LAYOUTS else "Black Bar")
         self.update_translate_button()
         self.refresh_api_status()
+        self.hotkey_pressed = bool(self.hotkey and virtual_key_is_down(self.hotkey.code))
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(50, self.poll_events)
+        if sys.platform == "win32":
+            self.root.after(25, self.poll_hotkey)
+            if self.overlay_enabled.get():
+                self.root.after_idle(self.update_overlay_visibility)
 
     def build_window(self) -> None:
         root = self.root
@@ -911,15 +1095,24 @@ class TranscriberApp:
         self.translate_button = ttk.Button(self.meta, text="Translate", style="Quiet.TButton", width=-1,
                                           command=self.open_translation_menu)
         self.translate_button.pack(side="left")
-        choose = ttk.Button(self.meta, text="Layout ▾", style="Quiet.TButton", width=-1, command=self.open_layout_menu)
+        choose = ttk.Button(self.meta, text="Options ▾", style="Quiet.TButton", width=-1, command=self.open_options_menu)
         choose.pack(side="left")
-        self.layout_button = choose
-        self.layout_menu = tk.Menu(root, tearoff=False, bg=BACKGROUND, fg=FOREGROUND,
-                                   activebackground="#1C1C1E", activeforeground=FOREGROUND,
-                                   font=(family, 10))
+        self.options_button = choose
+        menu_style = dict(tearoff=False, bg=BACKGROUND, fg=FOREGROUND, activebackground="#1C1C1E",
+                          activeforeground=FOREGROUND, font=(family, 10))
+        self.options_menu = tk.Menu(root, **menu_style)
+        self.layout_menu = tk.Menu(self.options_menu, **menu_style)
         for name in LAYOUTS:
             self.layout_menu.add_radiobutton(label=name, value=name, variable=self.layout_name,
                                              command=self.save_layout)
+        self.options_menu.add_cascade(label="Layout", menu=self.layout_menu)
+        self.hotkey_menu = tk.Menu(self.options_menu, **menu_style)
+        self.hotkey_menu.add_command(label="Current: Off", state="disabled")
+        self.hotkey_menu.add_command(label="Set key or mouse button…", command=self.choose_hotkey)
+        self.hotkey_menu.add_command(label="Off", command=lambda: self.save_hotkey(None))
+        self.options_menu.add_cascade(label="Hold to listen", menu=self.hotkey_menu)
+        self.options_menu.add_checkbutton(label="Caption overlay", variable=self.overlay_enabled,
+                                          command=self.save_overlay)
 
         self.wave = tk.Canvas(layout, bg=BACKGROUND, highlightthickness=0, width=52, height=18)
         self.wave_bars = [self.wave.create_line(0, 0, 0, 0, fill=BORDER, width=2, capstyle="round") for _ in self.levels]
@@ -1006,12 +1199,166 @@ class TranscriberApp:
         self.status.configure(text=text, fg=color)
         self.indicator.itemconfigure("dot", fill=color)
 
-    def open_layout_menu(self) -> None:
-        button = self.layout_button
+    def open_options_menu(self) -> None:
+        self.options_menu.entryconfigure("Hold to listen", state="disabled" if self.recording else "normal")
+        self.hotkey_menu.entryconfigure(0, label=f"Current: {self.hotkey.label if self.hotkey else 'Off'}")
+        button = self.options_button
         try:
-            self.layout_menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+            self.options_menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
         finally:
-            self.layout_menu.grab_release()
+            self.options_menu.grab_release()
+
+    def save_hotkey(self, binding: Hotkey | None) -> None:
+        self.hotkey = binding
+        self.hotkey_pressed = bool(binding and virtual_key_is_down(binding.code))
+        self.refresh_api_status()
+        try:
+            set_key(str(ENV_PATH), "TRANSCRIBER_HOTKEY", binding.as_setting() if binding else "", encoding="utf-8")
+        except OSError:
+            self.show_notice("Hotkey selected for this session. Could not save the preference.")
+
+    def choose_hotkey(self) -> None:
+        if self.recording or self.dialog_open:
+            return
+        self.dialog_open = True
+        dialog = tk.Toplevel(self.root, bg=BACKGROUND)
+        dialog.title("Hold-to-listen shortcut")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        width, height = 380, 194
+        x = max(0, self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2)
+        y = max(0, self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        content = tk.Frame(dialog, bg=BACKGROUND, padx=16, pady=13)
+        content.pack(fill="both", expand=True)
+        tk.Label(content, text="Press a key or click the box with a mouse button.", bg=BACKGROUND,
+                 fg=MUTED, font=(self.family, 9), anchor="w").pack(fill="x", pady=(0, 9))
+        capture = tk.Frame(content, bg=SURFACE, takefocus=True, highlightthickness=1,
+                           highlightbackground=BORDER, highlightcolor=ACCENT, height=65)
+        capture.pack(fill="x")
+        capture.pack_propagate(False)
+        candidate = self.hotkey
+        label = tk.StringVar(dialog, value=candidate.label if candidate else "Waiting for input")
+        tk.Label(capture, textvariable=label, bg=SURFACE, fg=FOREGROUND,
+                 font=(self.family, 15, "bold")).pack(expand=True)
+
+        previous_mouse = {code for code in MOUSE_BUTTONS if virtual_key_is_down(code)}
+        mouse_timer = None
+
+        def dismiss() -> None:
+            if mouse_timer is not None:
+                dialog.after_cancel(mouse_timer)
+            self.dialog_open = False
+            dialog.destroy()
+
+        def apply() -> None:
+            binding = candidate
+            dismiss()
+            if binding:
+                self.save_hotkey(binding)
+
+        actions = tk.Frame(content, bg=BACKGROUND)
+        actions.pack(side="bottom", fill="x")
+        apply_button = ttk.Button(actions, text="Apply", style="Primary.TButton", command=apply)
+        apply_button.pack(side="right")
+        ttk.Button(actions, text="Cancel", style="Quiet.TButton", command=dismiss).pack(side="right", padx=(0, 5))
+        if candidate is None:
+            apply_button.state(["disabled"])
+
+        def set_candidate(binding: Hotkey) -> None:
+            nonlocal candidate
+            candidate = binding
+            label.set(binding.label)
+            apply_button.state(["!disabled"])
+
+        def select_keyboard(event: tk.Event) -> str:
+            if binding := Hotkey.from_keyboard(event):
+                set_candidate(binding)
+            return "break"
+
+        def select_mouse() -> None:
+            nonlocal previous_mouse, mouse_timer
+            mouse = {code for code in MOUSE_BUTTONS if virtual_key_is_down(code)}
+            new_buttons = mouse - previous_mouse
+            previous_mouse = mouse
+            focus = dialog.focus_displayof()
+            if new_buttons and focus is not None and focus.winfo_toplevel() is dialog:
+                pointer_x, pointer_y = capture.winfo_pointerxy()
+                left, top = capture.winfo_rootx(), capture.winfo_rooty()
+                if left <= pointer_x < left + capture.winfo_width() and top <= pointer_y < top + capture.winfo_height():
+                    code = next(code for code in MOUSE_BUTTONS if code in new_buttons)
+                    set_candidate(Hotkey(code, MOUSE_BUTTONS[code]))
+                    capture.focus_set()
+            mouse_timer = dialog.after(15, select_mouse)
+
+        capture.bind("<KeyPress>", select_keyboard)
+        dialog.protocol("WM_DELETE_WINDOW", dismiss)
+        dialog.grab_set()
+        capture.focus_set()
+        mouse_timer = dialog.after(15, select_mouse)
+        if sys.platform == "win32":
+            dialog.after(100, lambda: self.set_dark_caption(dialog))
+
+    def poll_hotkey(self) -> None:
+        pressed = bool(self.hotkey and virtual_key_is_down(self.hotkey.code))
+        if pressed != self.hotkey_pressed:
+            self.hotkey_pressed = pressed
+            self.handle_hotkey(pressed)
+        self.root.after(25, self.poll_hotkey)
+
+    def handle_hotkey(self, pressed: bool) -> None:
+        recording = self.recording
+        if not pressed:
+            if recording and recording.hold_gate is not None:
+                recording.hold_gate.clear()
+                if not recording.stop_requested.is_set():
+                    self.started_at = None
+                    self.set_status(f"Hold {self.hotkey.label}")
+            return
+        if self.dialog_open or self.closing:
+            return
+        if self.hotkey and self.hotkey.is_mouse and self.root.winfo_containing(*self.root.winfo_pointerxy()) is not None:
+            return
+        if recording is None:
+            self.start(hold_to_listen=True)
+        elif recording.hold_gate is not None and not recording.stop_requested.is_set():
+            recording.hold_gate.set()
+            if recording.capture_ready.is_set():
+                self.clock.set("00:00")
+                self.started_at = time.monotonic()
+                self.set_status("Listening", RECORDING)
+
+    def save_overlay(self) -> None:
+        self.update_overlay_visibility()
+        try:
+            set_key(str(ENV_PATH), "TRANSCRIBER_CAPTION_OVERLAY", "1" if self.overlay_enabled.get() else "0", encoding="utf-8")
+        except OSError:
+            self.show_notice("Could not save the overlay preference.")
+
+    def update_overlay_visibility(self) -> None:
+        if not self.overlay_enabled.get():
+            if self.overlay:
+                self.overlay.window.destroy()
+                self.overlay = None
+            return
+        if self.overlay is None:
+            try:
+                self.overlay = CaptionOverlay(self.root, self.family)
+            except (OSError, tk.TclError, ValueError):
+                self.overlay_enabled.set(False)
+                self.show_notice("Could not open the Windows caption overlay.")
+                return
+        self.refresh_overlay()
+
+    def refresh_overlay(self) -> None:
+        if self.overlay is None:
+            return
+        text = self.transcript.get("end-291c", "end-1c") if self.has_text else ""
+        text = " ".join(text.split())
+        if len(text) > 260:
+            text = "… " + (text[-260:].partition(" ")[2] or text[-260:])
+        self.overlay.render(self.status.cget("text"), text or self.empty_hint.get() or "No transcript yet.")
+        self.overlay_refreshed_at = time.monotonic()
 
     def update_translate_button(self) -> None:
         self.translate_button.configure(style="Active.Quiet.TButton" if self.translation_language.get() else "Quiet.TButton")
@@ -1204,8 +1551,9 @@ class TranscriberApp:
             self.empty_hint.set("Check the .env file next to the app.")
             self.show_notice(str(exc))
         else:
-            self.set_status("Ready")
-            self.empty_hint.set("Press Start to transcribe system audio.")
+            key = self.hotkey.label if self.hotkey else ""
+            self.set_status(f"Hold {key}" if key else "Ready")
+            self.empty_hint.set(f"Hold {key} or press Start to listen." if key else "Press Start to transcribe system audio.")
 
     def open_settings(self) -> None:
         if self.dialog_open or self.recording:
@@ -1329,14 +1677,17 @@ class TranscriberApp:
         if sys.platform == "win32":
             dialog.after(100, lambda: self.set_dark_caption(dialog))
 
-    def start(self) -> None:
+    def start(self, *, hold_to_listen: bool = False) -> None:
         if self.recording or self.closing or self.dialog_open:
             return
         try:
             api = TranscriptionAPI.from_environment()
             translator = TranslationAPI.for_recording(api, self.translation_language.get())
         except APIKeyRequired:
-            self.open_settings()
+            if hold_to_listen:
+                self.show_notice("Set up a provider before using the hotkey.")
+            else:
+                self.open_settings()
             return
         except ValueError as exc:
             self.show_notice(str(exc))
@@ -1349,7 +1700,7 @@ class TranscriberApp:
         self.levels.extend([0.0] * len(self.levels))
         self.had_error = False
         self.active_workers = 3 if translator else 2
-        self.recording = Recording(api, self.output_name.get(), translator)
+        self.recording = Recording(api, self.output_name.get(), translator, hold_to_listen=hold_to_listen)
         self.start_button.state(["disabled"])
         self.stop_button.state(["!disabled"])
         self.settings_button.state(["disabled"])
@@ -1395,6 +1746,8 @@ class TranscriberApp:
         if any(self.levels) and (self.started_at is None or time.monotonic() - self.last_level_at > 0.12):
             self.levels.append(0.0)
         self.draw_wave()
+        if self.overlay and time.monotonic() - self.overlay_refreshed_at >= 0.25:
+            self.refresh_overlay()
         self.root.after(50, self.poll_events)
         if self.closing and self.recording is None and not self.dialog_open:
             self.closing = False
@@ -1406,9 +1759,13 @@ class TranscriberApp:
                 self.levels.append(float(value))
                 self.last_level_at = time.monotonic()
         elif event == "recording" and not self.recording.stop_requested.is_set():
-            self.started_at = time.monotonic()
-            self.set_status("Listening", RECORDING)
-            self.empty_hint.set("Listening to system audio…")
+            gate = self.recording.hold_gate
+            if gate is not None and not gate.is_set():
+                self.set_status(f"Hold {self.hotkey.label}")
+            else:
+                self.started_at = time.monotonic()
+                self.set_status("Listening", RECORDING)
+                self.empty_hint.set("Listening to system audio…")
         elif event == "text":
             self.append_text(str(value))
         elif event == "live_text":

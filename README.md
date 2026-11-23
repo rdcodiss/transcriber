@@ -22,6 +22,11 @@ A Windows app that transcribes audio playing through your headphones or speakers
 3. Under **Output**, choose the audio device used by the application you want to transcribe.
 4. Click **Start** to begin. Click **Stop** to finish and **Save TXT** to export the transcript.
 
+## Hotkey and caption overlay
+
+- Under **Options → Hold to listen → Set key or mouse button…**, press the keyboard key you want or click the box with the mouse button you want, including **Mouse 4** and **Mouse 5**. Click **Apply**, then hold the shortcut while the audio is playing. Release it to finish the segment. The shortcut still goes to the focused app.
+- Turn on **Options → Caption overlay** to see the latest text above other apps. Mouse clicks go through the overlay. Use windowed or borderless fullscreen mode in your simulator.
+
 ## Automatic translation
 
 Before recording, open **Translate** and select a target language. Choose **Other language…** to enter a language by name. Transcriber translates each completed segment and exports the translated text with **Save TXT**. Select **Off** to keep the spoken language. If the translation service is unavailable, the app shows the original speech.
